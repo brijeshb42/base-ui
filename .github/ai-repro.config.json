@@ -1,0 +1,8 @@
+{
+  "promptFile": ".github/ai-repro.prompt.md",
+  "package": "@base-ui/react",
+  "baseBranch": "master",
+  "releasedVersion": "latest",
+  "fixPaths": ["packages"],
+  "testCommand": ["pnpm", "test:jsdom", "{pattern}", "--no-watch"]
+}
