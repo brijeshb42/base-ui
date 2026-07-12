@@ -1,0 +1,80 @@
+name: AI Repro & Fix
+
+# A maintainer mentions the bot on a bug issue (e.g. `@repro-bot`, configurable via the
+# AI_REPRO_MENTION repo variable). An agent (pi coding-agent, provider configurable via
+# AI_REPRO_MODEL) reproduces the bug, attempts a fix, opens a draft PR, and posts
+# before/after StackBlitz links driven by pkg.pr.new.
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions: {}
+
+jobs:
+  repro:
+    # Issues only (not PR comments), the bot is mentioned, from a trusted author.
+    if: >-
+      ${{ !github.event.issue.pull_request &&
+      contains(github.event.comment.body, vars.AI_REPRO_MENTION || '@repro-bot') &&
+      contains(fromJson('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association) }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # push the repro/fix branch
+      issues: write # comment back with links
+      pull-requests: write # open the draft PR
+    steps:
+      - name: Acknowledge the mention
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        with:
+          script: |
+            await github.rest.reactions.createForIssueComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: context.payload.comment.id,
+              content: 'eyes',
+            });
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          # A PAT lets the draft PR trigger CI (and thus publish the pkg.pr.new
+          # canary). With the default token, CI won't run on the bot-created PR.
+          token: ${{ secrets.AI_REPRO_TOKEN || github.token }}
+          # Don't write the token into .git/config: the agent (fed untrusted issue
+          # text) must not be able to read it. The script pushes with an explicit URL.
+          persist-credentials: false
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@8912a9102ac27614460f54aedde9e1e7f9aec20d # v6.0.5
+
+      - name: Use Node.js 22.x
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: '22.18'
+          cache: 'pnpm'
+
+      - name: Install ripgrep
+        # The agent's `search` tool needs rg; it's not in the runner image.
+        run: sudo apt-get install -y --no-install-recommends ripgrep
+
+      - name: Install repo dependencies
+        run: pnpm install
+
+      - name: Install agent dependencies
+        run: npm install --prefix .github/ai-repro --no-package-lock
+
+      - name: Run repro agent
+        env:
+          GITHUB_TOKEN: ${{ secrets.AI_REPRO_TOKEN || github.token }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          REPO: ${{ github.repository }}
+          # Used to strip the triggering comment(s) from the context sent to the agent.
+          AI_REPRO_MENTION: ${{ vars.AI_REPRO_MENTION || '@repro-bot' }}
+          # Repo-specific settings live in .github/ai-repro.config.json + .prompt.md.
+          # These env vars are optional overrides (empty => the config defaults apply).
+          AI_REPRO_MODEL: ${{ vars.AI_REPRO_MODEL }}
+          AI_REPRO_RELEASED_VERSION: ${{ vars.AI_REPRO_RELEASED_VERSION }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          GOOGLE_GENERATIVE_AI_API_KEY: ${{ secrets.GOOGLE_GENERATIVE_AI_API_KEY }}
+        run: node .github/ai-repro/cli.mjs
