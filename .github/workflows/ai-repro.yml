@@ -135,9 +135,24 @@ jobs:
       - name: Install agent dependencies
         run: npm install --prefix .github/ai-repro --no-package-lock
 
+      - name: Resolve model provider
+        id: provider
+        # Mirrors the model resolution in .github/ai-repro/config.mjs (env var ->
+        # config file -> anthropic default) so only the matching API key is exposed.
+        env:
+          AI_REPRO_MODEL: ${{ vars.AI_REPRO_MODEL }}
+        run: |
+          MODEL="$AI_REPRO_MODEL"
+          if [ -z "$MODEL" ] && [ -f .github/ai-repro.config.json ]; then
+            MODEL=$(jq -r '.model // empty' .github/ai-repro.config.json)
+          fi
+          PROVIDER="${MODEL%%:*}"
+          echo "provider=${PROVIDER:-anthropic}" >> "$GITHUB_OUTPUT"
+
       - name: Run repro agent
         # Intentionally no GITHUB_TOKEN: the agent only reads the pre-fetched context,
         # works on the local checkout, and writes its results to the output dir.
+        # Only the API key for the resolved provider is exposed to the agent.
         env:
           AI_REPRO_CONTEXT: ${{ runner.temp }}/ai-repro/context.json
           AI_REPRO_OUTPUT_DIR: ${{ runner.temp }}/ai-repro/out
@@ -147,9 +162,9 @@ jobs:
           # These env vars are optional overrides (empty => the config defaults apply).
           AI_REPRO_MODEL: ${{ vars.AI_REPRO_MODEL }}
           AI_REPRO_RELEASED_VERSION: ${{ vars.AI_REPRO_RELEASED_VERSION }}
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          GOOGLE_GENERATIVE_AI_API_KEY: ${{ secrets.GOOGLE_GENERATIVE_AI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ steps.provider.outputs.provider == 'anthropic' && secrets.ANTHROPIC_API_KEY || '' }}
+          OPENAI_API_KEY: ${{ steps.provider.outputs.provider == 'openai' && secrets.OPENAI_API_KEY || '' }}
+          GOOGLE_GENERATIVE_AI_API_KEY: ${{ steps.provider.outputs.provider == 'google' && secrets.GOOGLE_GENERATIVE_AI_API_KEY || '' }}
         run: node .github/ai-repro/cli.mjs
 
       - name: Load agent result
