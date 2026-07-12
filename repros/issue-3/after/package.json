@@ -7,7 +7,7 @@
     "build": "vite build"
   },
   "dependencies": {
-    "@base-ui/react": "CANARY_PLACEHOLDER",
+    "@base-ui/react": "https://pkg.pr.new/brijeshb42/base-ui/@base-ui/react@4",
     "react": "latest",
     "react-dom": "latest"
   },
