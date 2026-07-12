@@ -1,44 +1,18 @@
 /* eslint-disable no-console */
-import {
-  AuthStorage,
-  ModelRegistry,
-  SessionManager,
-  createAgentSession,
-  defineTool,
-} from '@earendil-works/pi-coding-agent';
+import { Agent } from '@earendil-works/pi-agent-core';
+import { getBuiltinModel } from '@earendil-works/pi-ai/providers/all';
 import { Type } from 'typebox';
 import crypto from 'node:crypto';
 import { execFile } from 'node:child_process';
-import fs from 'node:fs/promises';
 import { promisify } from 'node:util';
 import { createTools } from './tools.mjs';
 import { writeReproApp, stackblitzUrl } from './repro-template.mjs';
 
 const execFileAsync = promisify(execFile);
 
-function makeGh(githubToken) {
-  return async function gh(args, opts = {}) {
-    const { stdout } = await execFileAsync('gh', args, {
-      maxBuffer: 20_000_000,
-      env: { ...process.env, GH_TOKEN: githubToken },
-      ...opts,
-    });
-    return stdout;
-  };
-}
-
 async function git(args) {
   const { stdout } = await execFileAsync('git', args, { maxBuffer: 20_000_000 });
   return stdout;
-}
-
-export async function postComment({ githubToken, repo, issueNumber }, body) {
-  await makeGh(githubToken)([
-    'api',
-    `repos/${repo}/issues/${issueNumber}/comments`,
-    '-f',
-    `body=${body}`,
-  ]);
 }
 
 function splitModelSpec(spec) {
@@ -49,24 +23,16 @@ function splitModelSpec(spec) {
   return [spec.slice(0, idx), spec.slice(idx + 1)];
 }
 
-async function runAgent({ config, providerApiKeys, prompt, wantsAppTsx }) {
+async function runAgent({ config, providerApiKeys, systemPrompt, prompt, wantsAppTsx }) {
   const [provider, modelId] = splitModelSpec(config.model);
 
-  // Keys live only in pi's in-memory auth — the caller must not leave them (or any
-  // other secret) in process.env, since the agent's tools run with this environment.
-  const authStorage = AuthStorage.create();
-  for (const [keyProvider, key] of Object.entries(providerApiKeys)) {
-    authStorage.setRuntimeApiKey(keyProvider, key);
-  }
-
-  const modelRegistry = ModelRegistry.create(authStorage);
-  const model = modelRegistry.find(provider, modelId);
+  const model = getBuiltinModel(provider, modelId);
   if (!model) {
     throw new Error(`Model "${modelId}" not found for provider "${provider}" (AI_REPRO_MODEL).`);
   }
 
   let outcome = null;
-  const finish = defineTool({
+  const finish = {
     name: 'finish',
     label: 'Finish',
     description: 'Call exactly once when done to report the reproduction and fix, then stop.',
@@ -92,35 +58,37 @@ async function runAgent({ config, providerApiKeys, prompt, wantsAppTsx }) {
     }),
     execute: async (_toolCallId, params) => {
       outcome = params;
-      return { content: [{ type: 'text', text: 'Recorded. Stop now.' }], details: {} };
+      return { content: [{ type: 'text', text: 'Recorded.' }], details: {}, terminate: true };
     },
-  });
+  };
 
-  // Explicit allowlist only — no built-in bash/read/write/edit and no web/fetch tool.
+  // The agent's tools are exactly this list — pi-agent-core has no built-in tools and
+  // no config/extension/skill discovery, unlike the coding-agent layer.
   const changedPaths = new Set();
-  const customTools = [
+  const tools = [
     ...createTools({ fixPaths: config.fixPaths, testCommand: config.testCommand, changedPaths }),
     finish,
   ];
 
-  const { session } = await createAgentSession({
-    model,
-    thinkingLevel: 'medium',
-    tools: customTools.map((t) => t.name),
-    customTools,
-    sessionManager: SessionManager.inMemory(),
-    authStorage,
-    modelRegistry,
+  const agent = new Agent({
+    initialState: { systemPrompt, model, thinkingLevel: 'medium', tools },
+    // Keys live only in this closure — the caller must not leave them (or any other
+    // secret) in process.env, since the agent's tools run with this environment.
+    getApiKey: (keyProvider) => providerApiKeys[keyProvider],
   });
 
-  session.subscribe((event) => {
+  agent.subscribe((event) => {
     if (event.type === 'tool_execution_end') {
       console.log(`  tool ${event.toolName}: ${event.isError ? 'error' : 'ok'}`);
     }
   });
 
   console.log(`Running ${config.model}…`);
-  await session.prompt(prompt);
+  await agent.prompt(prompt);
+  // Run failures (API/auth errors) don't reject prompt(); they land in state.errorMessage.
+  if (!outcome && agent.state.errorMessage) {
+    throw new Error(`Agent run failed: ${agent.state.errorMessage}`);
+  }
   return outcome;
 }
 
@@ -138,6 +106,10 @@ function sanitizeUntrusted(text) {
     .join('');
 }
 
+/**
+ * Trusted instructions (repo prompt + harness protocol) go in the system prompt; the
+ * untrusted, fenced issue report is the user message. Returns { systemPrompt, report }.
+ */
 function buildPrompt({ config, issueNumber, issue, discussion, libraryMode }) {
   // Generic protocol (harness-owned) appended after the repo's own instructions.
   const protocol = [
@@ -167,52 +139,56 @@ function buildPrompt({ config, issueNumber, issue, discussion, libraryMode }) {
     REPORT_CLOSE,
   ].join('\n');
 
-  return [config.prompt, '', protocol, '', report].join('\n');
+  return {
+    systemPrompt: [config.prompt, '', protocol].join('\n'),
+    report,
+  };
 }
 
 /**
- * The whole repro flow as a library: fetch the issue, run the agent, commit/push the
- * result, and open a draft PR. All inputs (tokens, ids, config) come from the caller —
- * nothing is read from the environment here. Returns { status, comment?, prUrl? };
- * posting `comment` back to the issue is the caller's job.
+ * The repro flow as a token-free library: run the agent on a pre-fetched issue context
+ * and commit the result locally. It never talks to GitHub — the caller pre-fetches
+ * `context` ({ repo, issueNumber, issue: { title, body }, comments: [{ user, body }] })
+ * and handles push / PR creation / commenting afterwards. Returns { status, comment?,
+ * prTitle?, prBody?, branch?, ... }; `comment` and the canary template may contain
+ * {{PR_URL}} / {{PR_NUMBER}} placeholders for the caller to substitute once the PR exists.
  */
 export async function runRepro(inputs) {
-  const {
-    githubToken,
-    issueNumber,
-    repo,
-    mention = '@repro-bot',
-    config,
-    providerApiKeys = {},
-  } = inputs;
-  const gh = makeGh(githubToken);
+  const { context, mention = '@repro-bot', config, providerApiKeys = {} } = inputs;
+  const { repo, issueNumber, issue, comments = [] } = context;
   // No slashes: StackBlitz github URLs can't disambiguate branch segments from path segments.
   const branch = `ai-repro-issue-${issueNumber}`;
   const reproRoot = `repros/issue-${issueNumber}`;
-  // Authenticated push URL (checkout uses persist-credentials: false, so the token is
-  // never written to .git/config where the agent could read it). Only used post-agent.
-  const pushRemote = `https://x-access-token:${githubToken}@github.com/${repo}.git`;
 
-  const issue = JSON.parse(await gh(['api', `repos/${repo}/issues/${issueNumber}`]));
-  const rawComments = JSON.parse(
-    await gh(['api', `repos/${repo}/issues/${issueNumber}/comments`, '--paginate']),
-  );
-  const discussion = rawComments
+  const discussion = comments
     .filter((c) => !c.body.includes(mention) && !c.body.trim().startsWith('/repro'))
     .slice(0, 10)
-    .map((c) => `@${c.user.login}: ${c.body}`)
+    .map((c) => `@${c.user}: ${c.body}`)
     .join('\n\n')
     .slice(0, 8000);
 
   const wantsAppTsx = Boolean(config.packageName);
-  const prompt = buildPrompt({ config, issueNumber, issue, discussion, libraryMode: wantsAppTsx });
+  const { systemPrompt, report } = buildPrompt({
+    config,
+    issueNumber,
+    issue,
+    discussion,
+    libraryMode: wantsAppTsx,
+  });
   console.log(`Running repro agent on issue #${issueNumber}…`);
-  const outcome = await runAgent({ config, providerApiKeys, prompt, wantsAppTsx });
+  const outcome = await runAgent({
+    config,
+    providerApiKeys,
+    systemPrompt,
+    prompt: report,
+    wantsAppTsx,
+  });
 
   if (!outcome) {
     return {
       status: 'no-finish',
-      comment: '🤖 The AI repro agent finished without calling `finish`. Check the workflow logs.',
+      comment:
+        '🤖 The AI repro agent finished without calling `finish`. Check the workflow run artifacts for logs.',
     };
   }
 
@@ -267,20 +243,27 @@ export async function runRepro(inputs) {
     '-m',
     `[repro] AI reproduction${hasFix ? ' and fix' : ''} for #${issueNumber}`,
   ]);
-  await git(['push', '--force', pushRemote, `HEAD:${branch}`]);
-
-  const ctx = { gh, git, config, issueNumber, repo, branch, reproRoot, pushRemote };
-  const prUrl = await createOrReusePr(ctx, outcome, hasFix);
-  const prNumber = prUrl.split('/').pop();
-
-  let liveSection = '';
-  if (libraryMode) {
-    liveSection = await pinCanaryAndBuildLinks(ctx, prNumber, outcome);
-  }
+  // Non-compact URL (owner/repo included) — the repo publishes with `--compact false`.
+  // The PR doesn't exist yet; the caller substitutes {{PR_NUMBER}} after creating it.
+  const canaryUrl = libraryMode
+    ? `https://pkg.pr.new/${repo}/${config.packageName}@{{PR_NUMBER}}`
+    : null;
+  const liveSection = libraryMode
+    ? buildLiveSection({ repo, branch, reproRoot, config, outcome, canaryUrl })
+    : '';
 
   return {
     status: hasFix ? 'fix-pr' : 'repro-pr',
-    prUrl,
+    branch,
+    reproRoot,
+    hasFix,
+    libraryMode,
+    baseBranch: config.baseBranch,
+    prTitle: `[repro] ${outcome.reproTitle} (fixes #${issueNumber})`,
+    prBody: buildPrBody({ config, issueNumber }, outcome, hasFix),
+    // The caller pins the canary into this file once the PR number is known.
+    canaryUrl,
+    afterPackageJson: libraryMode ? `${reproRoot}/after/package.json` : null,
     comment: [
       `## 🤖 AI reproduction & proposed fix for #${issueNumber}`,
       '',
@@ -292,47 +275,14 @@ export async function runRepro(inputs) {
       hasFix ? '### Proposed fix' : '### Analysis',
       outcome.fixSummary,
       liveSection,
-      `📝 Draft PR: ${prUrl}`,
+      `📝 Draft PR: {{PR_URL}}`,
       '',
       '_Auto-generated — review the diff before trusting the fix._',
     ].join('\n'),
   };
 }
 
-async function createOrReusePr(ctx, outcome, hasFix) {
-  const args = [
-    'pr',
-    'create',
-    '--draft',
-    '--head',
-    ctx.branch,
-    '--title',
-    `[repro] ${outcome.reproTitle} (fixes #${ctx.issueNumber})`,
-    '--body',
-    buildPrBody(ctx, outcome, hasFix),
-  ];
-  if (ctx.config.baseBranch) {
-    args.push('--base', ctx.config.baseBranch);
-  }
-  try {
-    return (await ctx.gh(args)).trim();
-  } catch {
-    // A PR for this branch already exists (re-run); reuse it.
-    return JSON.parse(await ctx.gh(['pr', 'view', ctx.branch, '--json', 'url'])).url;
-  }
-}
-
-async function pinCanaryAndBuildLinks(ctx, prNumber, outcome) {
-  const { config, issueNumber, repo, branch, reproRoot } = ctx;
-  // Non-compact URL (owner/repo included) — the repo publishes with `--compact false`.
-  const canary = `https://pkg.pr.new/${repo}/${config.packageName}@${prNumber}`;
-  const afterPkg = `${reproRoot}/after/package.json`;
-  const current = await fs.readFile(afterPkg, 'utf8');
-  await fs.writeFile(afterPkg, current.replace('CANARY_PLACEHOLDER', canary));
-  await ctx.git(['add', afterPkg]);
-  await ctx.git(['commit', '-m', `[repro] pin canary for #${issueNumber}`]);
-  await ctx.git(['push', ctx.pushRemote, `HEAD:${branch}`]);
-
+function buildLiveSection({ repo, branch, reproRoot, config, outcome, canaryUrl }) {
   const beforeLink = stackblitzUrl({ repo, branch, subdir: `${reproRoot}/before` });
   const afterLink = stackblitzUrl({ repo, branch, subdir: `${reproRoot}/after` });
 
@@ -344,7 +294,7 @@ async function pinCanaryAndBuildLinks(ctx, prNumber, outcome) {
     `| 🐞 Before (bug) | \`${config.releasedVersion}\` | [Open in StackBlitz](${beforeLink}) |`,
     `| ✅ After (fix) | canary of this PR | [Open in StackBlitz](${afterLink}) |`,
     '',
-    `> The **After** sandbox installs \`${canary}\`, available once the draft PR's CI publishes the canary (a few minutes). ${outcome.reproDescription}`,
+    `> The **After** sandbox installs \`${canaryUrl}\`, available once the draft PR's CI publishes the canary (a few minutes). ${outcome.reproDescription}`,
     '',
   ].join('\n');
 }

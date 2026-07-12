@@ -1,4 +1,3 @@
-import { defineTool } from '@earendil-works/pi-coding-agent';
 import { Type } from 'typebox';
 import { execFile } from 'node:child_process';
 import fs from 'node:fs/promises';
@@ -48,7 +47,7 @@ export function createTools({ fixPaths, testCommand, changedPaths }) {
   }
 
   const tools = [
-    defineTool({
+    {
       name: 'list_dir',
       label: 'List directory',
       description: 'List the entries of a directory inside the repository.',
@@ -58,9 +57,9 @@ export function createTools({ fixPaths, testCommand, changedPaths }) {
         const entries = dirents.map((d) => (d.isDirectory() ? `${d.name}/` : d.name));
         return text(entries.join('\n') || '(empty)');
       },
-    }),
+    },
 
-    defineTool({
+    {
       name: 'read_file',
       label: 'Read file',
       description: 'Read a UTF-8 file inside the repository (truncated to ~60KB).',
@@ -69,9 +68,9 @@ export function createTools({ fixPaths, testCommand, changedPaths }) {
         const c = await fs.readFile(resolveInside(p), 'utf8');
         return text(c.length > 60000 ? `${c.slice(0, 60000)}\n…[truncated]` : c);
       },
-    }),
+    },
 
-    defineTool({
+    {
       name: 'search',
       label: 'Search code',
       description:
@@ -93,9 +92,9 @@ export function createTools({ fixPaths, testCommand, changedPaths }) {
           return text(err.stdout?.slice(0, 40000) || '(no matches)');
         }
       },
-    }),
+    },
 
-    defineTool({
+    {
       name: 'write_file',
       label: 'Write file',
       description: `Create or overwrite a file (the fix and/or its test). Restricted to: ${fixPaths.join(', ')}.`,
@@ -107,45 +106,43 @@ export function createTools({ fixPaths, testCommand, changedPaths }) {
         changedPaths.add(p);
         return text(`Wrote ${p} (${content.length} bytes).`);
       },
-    }),
+    },
   ];
 
   // Only exposed when the repo configured a test command. Runs a FIXED command with one
   // sanitized pattern argument via execFile (no shell) — never agent-controlled argv.
   if (testCommand?.length) {
-    tools.push(
-      defineTool({
-        name: 'run_tests',
-        label: 'Run tests',
-        description:
-          'Run the project test suite for a component/pattern (e.g. "NumberField"). Bounded to 10 minutes.',
-        parameters: Type.Object({
-          pattern: Type.String({ description: 'Component or test name to filter by.' }),
-        }),
-        execute: async (_id, { pattern }) => {
-          const safe = String(pattern).trim();
-          if (!/^[A-Za-z0-9_./-]+$/.test(safe) || safe.startsWith('-')) {
-            throw new Error('Invalid pattern: use letters, digits, . / _ - and no leading dash.');
-          }
-          const [cmd, ...rest] = testCommand;
-          const args = rest.includes('{pattern}')
-            ? rest.map((a) => (a === '{pattern}' ? safe : a))
-            : [...rest, safe];
-          try {
-            const { stdout } = await execFileAsync(cmd, args, {
-              maxBuffer: 10_000_000,
-              timeout: 600_000,
-              cwd: ROOT,
-            });
-            return text(stdout.slice(-8000));
-          } catch (err) {
-            return text(
-              `${err.stdout || ''}${err.stderr || ''}`.slice(-8000) || String(err.message || err),
-            );
-          }
-        },
+    tools.push({
+      name: 'run_tests',
+      label: 'Run tests',
+      description:
+        'Run the project test suite for a component/pattern (e.g. "NumberField"). Bounded to 10 minutes.',
+      parameters: Type.Object({
+        pattern: Type.String({ description: 'Component or test name to filter by.' }),
       }),
-    );
+      execute: async (_id, { pattern }) => {
+        const safe = String(pattern).trim();
+        if (!/^[A-Za-z0-9_./-]+$/.test(safe) || safe.startsWith('-')) {
+          throw new Error('Invalid pattern: use letters, digits, . / _ - and no leading dash.');
+        }
+        const [cmd, ...rest] = testCommand;
+        const args = rest.includes('{pattern}')
+          ? rest.map((a) => (a === '{pattern}' ? safe : a))
+          : [...rest, safe];
+        try {
+          const { stdout } = await execFileAsync(cmd, args, {
+            maxBuffer: 10_000_000,
+            timeout: 600_000,
+            cwd: ROOT,
+          });
+          return text(stdout.slice(-8000));
+        } catch (err) {
+          return text(
+            `${err.stdout || ''}${err.stderr || ''}`.slice(-8000) || String(err.message || err),
+          );
+        }
+      },
+    });
   }
 
   return tools;

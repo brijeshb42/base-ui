@@ -1,9 +1,15 @@
 name: AI Repro & Fix
 
 # A maintainer mentions the bot on a bug issue (e.g. `@repro-bot`, configurable via the
-# AI_REPRO_MENTION repo variable). An agent (pi coding-agent, provider configurable via
+# AI_REPRO_MENTION repo variable). An agent (pi-agent-core, provider configurable via
 # AI_REPRO_MODEL) reproduces the bug, attempts a fix, opens a draft PR, and posts
 # before/after StackBlitz links driven by pkg.pr.new.
+#
+# The agent step itself runs with NO GitHub token: the issue context is pre-fetched into
+# a JSON file, the agent only reads/writes local files, and later steps consume its
+# output files (result.json / result.md / pr-body.md) to push, open the PR, and comment.
+# Context and outputs live under $RUNNER_TEMP/ai-repro — outside the checkout, so the
+# agent's repo-confined tools cannot read them.
 
 on:
   issue_comment:
@@ -35,13 +41,37 @@ jobs:
               content: 'eyes',
             });
 
+      - name: Fetch issue context
+        # Pre-fetches everything the agent may need so the agent step needs no token.
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        env:
+          CONTEXT_FILE: ${{ runner.temp }}/ai-repro/context.json
+        with:
+          script: |
+            const fs = require('node:fs');
+            const path = require('node:path');
+            const { owner, repo } = context.repo;
+            const issueNumber = context.payload.issue.number;
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner,
+              repo,
+              issue_number: issueNumber,
+              per_page: 100,
+            });
+            const data = {
+              repo: `${owner}/${repo}`,
+              issueNumber,
+              issue: {
+                title: context.payload.issue.title,
+                body: context.payload.issue.body,
+              },
+              comments: comments.map((c) => ({ user: c.user.login, body: c.body })),
+            };
+            fs.mkdirSync(path.dirname(process.env.CONTEXT_FILE), { recursive: true });
+            fs.writeFileSync(process.env.CONTEXT_FILE, JSON.stringify(data, null, 2));
+
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          # A PAT lets the draft PR trigger CI (and thus publish the pkg.pr.new
-          # canary). With the default token, CI won't run on the bot-created PR.
-          token: ${{ secrets.AI_REPRO_TOKEN || github.token }}
-          # Don't write the token into .git/config: the agent (fed untrusted issue
-          # text) must not be able to read it. The script pushes with an explicit URL.
           persist-credentials: false
 
       - name: Set up pnpm
@@ -50,7 +80,7 @@ jobs:
       - name: Use Node.js 22.x
         uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
         with:
-          node-version: '22.18'
+          node-version: '22.22.3'
           cache: 'pnpm'
 
       - name: Install ripgrep
@@ -64,10 +94,11 @@ jobs:
         run: npm install --prefix .github/ai-repro --no-package-lock
 
       - name: Run repro agent
+        # Intentionally no GITHUB_TOKEN: the agent only reads the pre-fetched context,
+        # works on the local checkout, and writes its results to the output dir.
         env:
-          GITHUB_TOKEN: ${{ secrets.AI_REPRO_TOKEN || github.token }}
-          ISSUE_NUMBER: ${{ github.event.issue.number }}
-          REPO: ${{ github.repository }}
+          AI_REPRO_CONTEXT: ${{ runner.temp }}/ai-repro/context.json
+          AI_REPRO_OUTPUT_DIR: ${{ runner.temp }}/ai-repro/out
           # Used to strip the triggering comment(s) from the context sent to the agent.
           AI_REPRO_MENTION: ${{ vars.AI_REPRO_MENTION || '@repro-bot' }}
           # Repo-specific settings live in .github/ai-repro.config.json + .prompt.md.
@@ -78,3 +109,70 @@ jobs:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           GOOGLE_GENERATIVE_AI_API_KEY: ${{ secrets.GOOGLE_GENERATIVE_AI_API_KEY }}
         run: node .github/ai-repro/cli.mjs
+
+      - name: Load agent result
+        id: result
+        if: always()
+        run: |
+          OUT="$RUNNER_TEMP/ai-repro/out"
+          if [ -f "$OUT/result.json" ]; then
+            {
+              echo "status=$(jq -r '.status // empty' "$OUT/result.json")"
+              echo "library_mode=$(jq -r '.libraryMode // false' "$OUT/result.json")"
+            } >> "$GITHUB_OUTPUT"
+          fi
+          echo "has_comment=$([ -f "$OUT/result.md" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
+      - name: Push branch and open draft PR
+        id: pr
+        if: always() && contains(fromJson('["fix-pr", "repro-pr"]'), steps.result.outputs.status)
+        env:
+          # A PAT lets the draft PR trigger CI (and thus publish the pkg.pr.new canary).
+          # With the default token, CI won't run on the bot-created PR.
+          GH_TOKEN: ${{ secrets.AI_REPRO_TOKEN || github.token }}
+        run: |
+          OUT="$RUNNER_TEMP/ai-repro/out"
+          BRANCH=$(jq -r '.branch' "$OUT/result.json")
+          BASE=$(jq -r '.baseBranch // empty' "$OUT/result.json")
+          git push --force "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:refs/heads/${BRANCH}"
+          ARGS=(--draft --head "$BRANCH" --title "$(jq -r '.prTitle' "$OUT/result.json")" --body-file "$OUT/pr-body.md")
+          if [ -n "$BASE" ]; then
+            ARGS+=(--base "$BASE")
+          fi
+          # `create` fails when a PR for this branch already exists (re-run); reuse it.
+          PR_URL=$(gh pr create "${ARGS[@]}" || gh pr view "$BRANCH" --json url --jq .url)
+          echo "url=$PR_URL" >> "$GITHUB_OUTPUT"
+          echo "number=${PR_URL##*/}" >> "$GITHUB_OUTPUT"
+
+      - name: Pin the canary version in the after sandbox
+        if: steps.pr.outputs.number && steps.result.outputs.library_mode == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.AI_REPRO_TOKEN || github.token }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+        run: |
+          OUT="$RUNNER_TEMP/ai-repro/out"
+          BRANCH=$(jq -r '.branch' "$OUT/result.json")
+          AFTER=$(jq -r '.afterPackageJson' "$OUT/result.json")
+          CANARY=$(jq -r '.canaryUrl' "$OUT/result.json" | sed "s/{{PR_NUMBER}}/${PR_NUMBER}/")
+          sed -i "s|CANARY_PLACEHOLDER|${CANARY}|" "$AFTER"
+          git add "$AFTER"
+          git commit -m "[repro] pin canary for #${{ github.event.issue.number }}"
+          git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:refs/heads/${BRANCH}"
+
+      - name: Post result comment
+        if: always() && steps.result.outputs.has_comment == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_URL: ${{ steps.pr.outputs.url }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+        run: |
+          BODY=$(sed -e "s|{{PR_URL}}|${PR_URL}|g" -e "s|{{PR_NUMBER}}|${PR_NUMBER}|g" "$RUNNER_TEMP/ai-repro/out/result.md")
+          gh api "repos/${GITHUB_REPOSITORY}/issues/${{ github.event.issue.number }}/comments" -f body="$BODY"
+
+      - name: Upload agent logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ai-repro-issue-${{ github.event.issue.number }}
+          path: ${{ runner.temp }}/ai-repro/out
+          if-no-files-found: ignore

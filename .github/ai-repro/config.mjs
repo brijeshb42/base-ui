@@ -40,7 +40,7 @@ export async function loadConfig() {
     // Repo-specific instructions handed to the agent as the first part of the prompt.
     prompt: prompt.trim(),
     promptFile,
-    // provider:model-id passed to pi's ModelRegistry.find().
+    // provider:model-id looked up in pi-ai's built-in model catalog.
     model: process.env.AI_REPRO_MODEL || file.model || 'anthropic:claude-opus-4-5',
     // npm package name. When set, enables "library mode": before/after StackBlitz
     // sandboxes powered by pkg.pr.new. Leave unset for non-library repos.
