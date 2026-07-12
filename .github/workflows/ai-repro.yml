@@ -1,9 +1,12 @@
 name: AI Repro & Fix
 
-# A maintainer mentions the bot on a bug issue (e.g. `@repro-bot`, configurable via the
-# AI_REPRO_MENTION repo variable). An agent (pi-agent-core, provider configurable via
-# AI_REPRO_MODEL) reproduces the bug, attempts a fix, opens a draft PR, and posts
-# before/after StackBlitz links driven by pkg.pr.new.
+# A maintainer mentions the bot (e.g. `@repro-bot`, configurable via the AI_REPRO_MENTION
+# repo variable) and an agent (pi-agent-core, provider configurable via AI_REPRO_MODEL)
+# runs the task matching where it was mentioned:
+# - on a bug **issue**: reproduces the bug, attempts a fix, opens a draft PR, and posts
+#   before/after StackBlitz links driven by pkg.pr.new;
+# - on a **pull request**: reviews the PR (read-only tools + tests) and posts the review
+#   as a comment.
 #
 # The agent step itself runs with NO GitHub token: the issue context is pre-fetched into
 # a JSON file, the agent only reads/writes local files, and later steps consume its
@@ -19,10 +22,9 @@ permissions: {}
 
 jobs:
   repro:
-    # Issues only (not PR comments), the bot is mentioned, from a trusted author.
+    # The bot is mentioned by a trusted author (issue => repro task, PR => review task).
     if: >-
-      ${{ !github.event.issue.pull_request &&
-      contains(github.event.comment.body, vars.AI_REPRO_MENTION || '@repro-bot') &&
+      ${{ contains(github.event.comment.body, vars.AI_REPRO_MENTION || '@repro-bot') &&
       contains(fromJson('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association) }}
     runs-on: ubuntu-latest
     permissions:
@@ -41,8 +43,10 @@ jobs:
               content: 'eyes',
             });
 
-      - name: Fetch issue context
+      - name: Fetch issue/PR context
+        id: context
         # Pre-fetches everything the agent may need so the agent step needs no token.
+        # An issue mention becomes a `repro` task, a PR mention a `review` task.
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
         env:
           CONTEXT_FILE: ${{ runner.temp }}/ai-repro/context.json
@@ -52,26 +56,64 @@ jobs:
             const path = require('node:path');
             const { owner, repo } = context.repo;
             const issueNumber = context.payload.issue.number;
-            const comments = await github.paginate(github.rest.issues.listComments, {
-              owner,
-              repo,
-              issue_number: issueNumber,
-              per_page: 100,
-            });
-            const data = {
-              repo: `${owner}/${repo}`,
-              issueNumber,
-              issue: {
-                title: context.payload.issue.title,
-                body: context.payload.issue.body,
-              },
-              comments: comments.map((c) => ({ user: c.user.login, body: c.body })),
-            };
+            const comments = (
+              await github.paginate(github.rest.issues.listComments, {
+                owner,
+                repo,
+                issue_number: issueNumber,
+                per_page: 100,
+              })
+            ).map((c) => ({ user: c.user.login, body: c.body }));
+
+            let data;
+            if (context.payload.issue.pull_request) {
+              const { data: pr } = await github.rest.pulls.get({
+                owner,
+                repo,
+                pull_number: issueNumber,
+              });
+              const { data: diff } = await github.rest.pulls.get({
+                owner,
+                repo,
+                pull_number: issueNumber,
+                mediaType: { format: 'diff' },
+              });
+              data = {
+                task: 'review',
+                repo: `${owner}/${repo}`,
+                prNumber: issueNumber,
+                pr: {
+                  title: pr.title,
+                  body: pr.body,
+                  baseRef: pr.base.ref,
+                  headRef: pr.head.ref,
+                  author: pr.user.login,
+                },
+                diff: String(diff).slice(0, 300000),
+                comments,
+              };
+              // Review the PR head; works for fork PRs via the base repo's pull ref.
+              core.setOutput('checkout_ref', `refs/pull/${issueNumber}/head`);
+            } else {
+              data = {
+                task: 'repro',
+                repo: `${owner}/${repo}`,
+                issueNumber,
+                issue: {
+                  title: context.payload.issue.title,
+                  body: context.payload.issue.body,
+                },
+                comments,
+              };
+              core.setOutput('checkout_ref', '');
+            }
             fs.mkdirSync(path.dirname(process.env.CONTEXT_FILE), { recursive: true });
             fs.writeFileSync(process.env.CONTEXT_FILE, JSON.stringify(data, null, 2));
 
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
+          # Empty for issues (default branch); the PR head ref for reviews.
+          ref: ${{ steps.context.outputs.checkout_ref }}
           persist-credentials: false
 
       - name: Set up pnpm

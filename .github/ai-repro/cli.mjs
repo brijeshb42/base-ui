@@ -2,7 +2,11 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { loadConfig } from './config.mjs';
-import { runRepro } from './index.mjs';
+import { runRepro } from './repro.mjs';
+import { runReview } from './review.mjs';
+
+// The task to run is chosen by the pre-fetched context (issue => repro, PR => review).
+const TASKS = { repro: runRepro, review: runReview };
 
 // This process never talks to GitHub: the issue context is pre-fetched into a JSON file
 // by the workflow, and all results are written to files for later steps to act on.
@@ -64,10 +68,16 @@ for (const [provider, envName] of Object.entries(PROVIDER_KEY_ENV)) {
 
 const context = JSON.parse(fs.readFileSync(AI_REPRO_CONTEXT, 'utf8'));
 
+const task = context.task || 'repro';
+const runTask = TASKS[task];
+if (!runTask) {
+  throw new Error(`Unknown task "${task}" in the context file.`);
+}
+
 const inputs = {
   context,
   mention: process.env.AI_REPRO_MENTION || '@repro-bot',
-  config: await loadConfig(),
+  config: await loadConfig(task),
   providerApiKeys,
 };
 
@@ -91,7 +101,7 @@ function writeOutputs({ comment, prBody, ...meta }) {
 }
 
 try {
-  const result = await runRepro(inputs);
+  const result = await runTask(inputs);
   writeOutputs(result);
   console.log(`Done (${result.status}).`);
 } catch (err) {
@@ -99,7 +109,7 @@ try {
   writeOutputs({
     status: 'failed',
     comment:
-      '🤖 AI repro agent failed: ' +
+      `🤖 AI ${task} agent failed: ` +
       `\`${String(err.message || err).slice(0, 500)}\`\n\n` +
       'See the workflow run artifacts for logs.',
   });

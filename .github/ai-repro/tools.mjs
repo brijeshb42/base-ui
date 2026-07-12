@@ -29,10 +29,11 @@ const text = (t) => ({ content: [{ type: 'text', text: t }], details: {} });
 
 /**
  * The agent's entire capability surface: read-only exploration, writes confined to the
- * configured fix paths, and a single whitelisted test command. No shell, no network.
- * `changedPaths` collects what was written (for logging/sanity).
+ * configured fix paths (omitted entirely with `allowWrite: false`), and a single
+ * whitelisted test command. No shell, no network. `changedPaths` collects what was
+ * written (for logging/sanity).
  */
-export function createTools({ fixPaths, testCommand, changedPaths }) {
+export function createTools({ fixPaths, testCommand, changedPaths, allowWrite = true }) {
   const writeRoots = (fixPaths?.length ? fixPaths : ['.']).map((p) => resolveInside(p));
 
   function assertWritable(rel) {
@@ -41,7 +42,7 @@ export function createTools({ fixPaths, testCommand, changedPaths }) {
       throw new Error('Writing under .github/ or .git/ is not allowed.');
     }
     if (!writeRoots.some((root) => abs === root || abs.startsWith(root + path.sep))) {
-      throw new Error(`write_file is restricted to: ${fixPaths.join(', ')}`);
+      throw new Error(`write_file is restricted to: ${(fixPaths ?? ['.']).join(', ')}`);
     }
     return abs;
   }
@@ -93,21 +94,23 @@ export function createTools({ fixPaths, testCommand, changedPaths }) {
         }
       },
     },
+  ];
 
-    {
+  if (allowWrite) {
+    tools.push({
       name: 'write_file',
       label: 'Write file',
-      description: `Create or overwrite a file (the fix and/or its test). Restricted to: ${fixPaths.join(', ')}.`,
+      description: `Create or overwrite a file (the fix and/or its test). Restricted to: ${(fixPaths ?? ['.']).join(', ')}.`,
       parameters: Type.Object({ path: Type.String(), content: Type.String() }),
       execute: async (_id, { path: p, content }) => {
         const abs = assertWritable(p);
         await fs.mkdir(path.dirname(abs), { recursive: true });
         await fs.writeFile(abs, content);
-        changedPaths.add(p);
+        changedPaths?.add(p);
         return text(`Wrote ${p} (${content.length} bytes).`);
       },
-    },
-  ];
+    });
+  }
 
   // Only exposed when the repo configured a test command. Runs a FIXED command with one
   // sanitized pattern argument via execFile (no shell) — never agent-controlled argv.

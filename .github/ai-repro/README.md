@@ -1,7 +1,12 @@
 # AI Repro & Fix agent
 
-A repo-agnostic slash-command agent that reproduces a reported bug, attempts a fix, opens
-a draft PR, and (for libraries) posts before/after live sandboxes for devs to test.
+A repo-agnostic slash-command agent harness with two tasks, picked by where the bot is
+mentioned:
+
+- **repro** (issues): reproduces a reported bug, attempts a fix, opens a draft PR, and
+  (for libraries) posts before/after live sandboxes for devs to test.
+- **review** (pull requests): reviews the PR with read-only tools + the test suite and
+  posts a verdict with findings as a comment.
 
 Built on the [pi](https://github.com/earendil-works/pi) core agent library
 (`@earendil-works/pi-agent-core` + `@earendil-works/pi-ai`), which provides the agent
@@ -10,6 +15,8 @@ loop and multi-provider streaming. Unlike pi's coding-agent layer, the core `Age
 narrow, repo-scoped allowlist of custom tools (see [Safety](#safety--prompt-injection)).
 
 ## How it works
+
+### Repro (issues)
 
 1. A maintainer **mentions the bot** on a bug **issue** (e.g. `@repro-bot please repro`).
 2. `.github/workflows/ai-repro.yml` gates on the mention + author association, then
@@ -31,6 +38,18 @@ narrow, repo-scoped allowlist of custom tools (see [Safety](#safety--prompt-inje
    comment carries **StackBlitz** links — `before` pinned to the last release, `after`
    to the canary.
 
+### Review (pull requests)
+
+1. A maintainer **mentions the bot** on a **PR** (e.g. `@repro-bot please review`).
+2. The context step pre-fetches the PR metadata, **diff** (truncated to 300KB), and
+   discussion into the JSON file, and the checkout step checks out the **PR head**
+   (`refs/pull/<n>/head`).
+3. `cli.mjs` dispatches on `context.task` and runs the review agent — same harness, but
+   a **read-only tool surface** (no `write_file`) plus `run_tests`, and a review-shaped
+   `finish` tool (verdict + findings with file/line/severity).
+4. The agent never pushes or opens PRs; the only follow-up step that fires is posting
+   `result.md` (the review) as a comment, plus the logs artifact.
+
 StackBlitz opens each folder straight from the branch
 (`stackblitz.com/github/<repo>/tree/<branch>/repros/issue-<n>/after`), so no StackBlitz
 account/token is needed. The **after** sandbox only installs once the PR's canary
@@ -40,9 +59,13 @@ finishes publishing (a few minutes).
 
 Copy `.github/ai-repro/`, `.github/workflows/ai-repro.yml`, and add two repo-owned files:
 
-**`.github/ai-repro.prompt.md`** — repo-specific instructions handed to the agent (where
-source lives, how to run tests, conventions, which paths it may edit). This is the "maybe
-from a file path" prompt — swap it per repo, no code changes.
+**`.github/ai-repro.prompt.md`** — repo-specific instructions handed to the repro agent
+(where source lives, how to run tests, conventions, which paths it may edit). This is the
+"maybe from a file path" prompt — swap it per repo, no code changes.
+
+**`.github/ai-review.prompt.md`** _(optional)_ — repo-specific review instructions for
+the review task (override with `reviewPromptFile` in the config or the
+`AI_REVIEW_PROMPT_FILE` env var). Without it, a generic built-in review prompt applies.
 
 **`.github/ai-repro.config.json`** — repo settings:
 
@@ -105,13 +128,20 @@ bot too.)
 ## Files
 
 - `cli.mjs` — entry point: reads the pre-fetched context JSON (`AI_REPRO_CONTEXT`),
-  scrubs secrets, calls the library, and writes `result.json` / `result.md` /
-  `pr-body.md` / `logs.txt` / `errors.txt` to `AI_REPRO_OUTPUT_DIR`. Never talks to GitHub.
-- `config.mjs` — loads the prompt + JSON config (env overrides).
-- `tools.mjs` — the agent's entire capability surface (repo-scoped, no shell/network).
-- `index.mjs` — env-free, token-free library: `runRepro(inputs)` runs the agent on the
-  provided context, commits locally, and returns `{ status, comment, prTitle, prBody, ... }`.
-  Push, PR creation, canary pinning, and commenting are workflow steps.
+  dispatches on `context.task` (`repro` | `review`), scrubs secrets, and writes
+  `result.json` / `result.md` / `pr-body.md` / `logs.txt` / `errors.txt` to
+  `AI_REPRO_OUTPUT_DIR`. Never talks to GitHub.
+- `harness.mjs` — the task-agnostic core: `runAgent` (pi-agent-core loop with an explicit
+  tool allowlist + a task-specific `finish` tool), the untrusted-content fence, and the
+  discussion builder. New tasks build on this.
+- `config.mjs` — loads the per-task prompt + shared JSON config (env overrides).
+- `tools.mjs` — the agents' entire capability surface (repo-scoped, no shell/network);
+  `allowWrite: false` yields the read-only variant used by review.
+- `repro.mjs` — the repro task: runs the agent on an issue context, commits locally, and
+  returns `{ status, comment, prTitle, prBody, ... }`. Push, PR creation, canary pinning,
+  and commenting are workflow steps.
+- `review.mjs` — the review task: read-only agent over the PR context/diff, returns the
+  review comment (verdict + findings). Nothing is written or pushed.
 - `repro-template.mjs` — Vite/React repro scaffold + StackBlitz URL builder (library mode).
 
 This package is intentionally outside the pnpm workspace (installed with `npm` at CI
@@ -146,6 +176,11 @@ hijack it. Defenses, in order of importance:
 5. **Trigger gating + limited persistence.** Only `OWNER`/`MEMBER`/`COLLABORATOR` can invoke;
    only `fixPaths` + generated `repros/` are committed (lockfiles reset out); the PR is always
    a **draft**.
+
+The **review** task narrows this further: it gets no `write_file` at all. Note that
+reviewing a PR checks out the **PR head**, so `pnpm install` (lifecycle scripts) and
+`run_tests` execute the PR's code — that's inherent to testing it. The maintainer-only
+trigger gate is what vouches for running it; the step still holds no tokens.
 
 **Residual risk:** the one code-execution surface left is `run_tests` — the agent can write
 a fix/test file under `fixPaths` and run the test suite, which executes that code. That's
