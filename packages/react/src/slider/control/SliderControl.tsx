@@ -343,12 +343,29 @@ export const SliderControl = React.forwardRef(function SliderControl(
     }
   });
 
-  const handleTouchEnd = useStableCallback((nativeEvent: TouchEvent | PointerEvent) => {
+  // Tears down the current press/drag without committing. Safe to call more than once, so
+  // browsers that deliver both `pointercancel` and `touchcancel` for the same gesture only
+  // clean up once and never leave a document listener armed for an unrelated pointer.
+  const endInteraction = useStableCallback((nativeEvent: TouchEvent | PointerEvent) => {
     setActive(-1);
     setDragging(false);
 
     pressedThumbCenterOffsetRef.current = null;
 
+    if (
+      'pointerType' in nativeEvent &&
+      controlRef.current?.hasPointerCapture(nativeEvent.pointerId)
+    ) {
+      controlRef.current?.releasePointerCapture(nativeEvent.pointerId);
+    }
+
+    pressedThumbIndexRef.current = -1;
+    touchIdRef.current = null;
+    // eslint-disable-next-line @typescript-eslint/no-use-before-define
+    stopListening();
+  });
+
+  const handleTouchEnd = useStableCallback((nativeEvent: TouchEvent | PointerEvent) => {
     // If the value array shrank or grew mid-drag, the cached interaction value no longer
     // matches the current thumbs (the pressed index can still be in range), so dropping it
     // keeps a stale or malformed array from being committed on release.
@@ -365,17 +382,15 @@ export const SliderControl = React.forwardRef(function SliderControl(
       );
     }
 
-    if (
-      'pointerType' in nativeEvent &&
-      controlRef.current?.hasPointerCapture(nativeEvent.pointerId)
-    ) {
-      controlRef.current?.releasePointerCapture(nativeEvent.pointerId);
-    }
+    endInteraction(nativeEvent);
+  });
 
-    pressedThumbIndexRef.current = -1;
-    touchIdRef.current = null;
-    // eslint-disable-next-line @typescript-eslint/no-use-before-define
-    stopListening();
+  // A cancelled gesture (`pointercancel`/`touchcancel`) ends the interaction without
+  // committing: the browser claimed the pointer for something else (scrolling, a system
+  // gesture, a second finger), so the last dragged value must not be committed by whatever
+  // `pointerup` happens next on the document.
+  const handleTouchCancel = useStableCallback((nativeEvent: TouchEvent | PointerEvent) => {
+    endInteraction(nativeEvent);
   });
 
   const handleTouchStart = useStableCallback((nativeEvent: TouchEvent) => {
@@ -411,14 +426,17 @@ export const SliderControl = React.forwardRef(function SliderControl(
     const doc = ownerDocument(controlRef.current);
     doc.addEventListener('touchmove', handleTouchMove, { passive: true });
     doc.addEventListener('touchend', handleTouchEnd, { passive: true });
+    doc.addEventListener('touchcancel', handleTouchCancel, { passive: true });
   });
 
   const stopListening = useStableCallback(() => {
     const doc = ownerDocument(controlRef.current);
     doc.removeEventListener('pointermove', handleTouchMove);
     doc.removeEventListener('pointerup', handleTouchEnd);
+    doc.removeEventListener('pointercancel', handleTouchCancel);
     doc.removeEventListener('touchmove', handleTouchMove);
     doc.removeEventListener('touchend', handleTouchEnd);
+    doc.removeEventListener('touchcancel', handleTouchCancel);
     pressedValuesRef.current = null;
     currentInteractionValueRef.current = null;
   });
@@ -512,6 +530,7 @@ export const SliderControl = React.forwardRef(function SliderControl(
           const doc = ownerDocument(control);
           doc.addEventListener('pointermove', handleTouchMove, { passive: true });
           doc.addEventListener('pointerup', handleTouchEnd, { once: true });
+          doc.addEventListener('pointercancel', handleTouchCancel, { once: true });
         },
       },
       elementProps,
