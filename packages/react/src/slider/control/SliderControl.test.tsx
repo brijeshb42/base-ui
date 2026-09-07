@@ -224,6 +224,191 @@ describe('<Slider.Control />', () => {
     unmount();
   });
 
+  describe('drag cancellation', () => {
+    [
+      { events: 'pointer', cancelEvent: 'pointercancel' },
+      { events: 'touch', cancelEvent: 'touchcancel' },
+      { events: 'pointer and touch', cancelEvent: 'pointercancel' },
+      { events: 'pointer and touch', cancelEvent: 'touchcancel' },
+    ].forEach(({ events, cancelEvent }) => {
+      const hasPointer = events.includes('pointer');
+      const hasTouch = events.includes('touch');
+
+      it.skipIf(hasTouch && (isJSDOM || typeof Touch === 'undefined'))(
+        `cleans up ${events} listeners on ${cancelEvent} without committing`,
+        async () => {
+          const onValueChange = vi.fn();
+          const onValueCommitted = vi.fn();
+
+          await render(
+            <React.Fragment>
+              <Slider.Root
+                defaultValue={20}
+                onValueChange={onValueChange}
+                onValueCommitted={onValueCommitted}
+              >
+                <Slider.Control data-testid="control">
+                  <Slider.Thumb data-testid="thumb" />
+                </Slider.Control>
+              </Slider.Root>
+              <div data-testid="elsewhere" />
+            </React.Fragment>,
+          );
+
+          const control = screen.getByTestId('control');
+          const thumb = screen.getByTestId('thumb');
+          const elsewhere = screen.getByTestId('elsewhere');
+          vi.spyOn(control, 'getBoundingClientRect').mockImplementation(getHorizontalSliderRect);
+          vi.spyOn(thumb, 'getBoundingClientRect').mockReturnValue(new DOMRect(10, 0, 20, 10));
+
+          // Synthetic pointer events cannot acquire native pointer capture.
+          const releasePointerCapture = vi.fn();
+          Object.defineProperties(control, {
+            setPointerCapture: { configurable: true, value: vi.fn() },
+            hasPointerCapture: { configurable: true, value: () => true },
+            releasePointerCapture: { configurable: true, value: releasePointerCapture },
+          });
+
+          const pointer = { pointerId: 7, pointerType: 'touch', button: 0, buttons: 1 };
+          const addListener = vi.spyOn(document, 'addEventListener');
+          const removeListener = vi.spyOn(document, 'removeEventListener');
+
+          try {
+            if (hasPointer) {
+              fireEvent.pointerDown(thumb, { ...pointer, clientX: 25 });
+            }
+            if (hasTouch) {
+              fireEvent.touchStart(
+                thumb,
+                createTouches([{ identifier: 1, clientX: 25, clientY: 0 }]),
+              );
+            }
+
+            [40, 55, 75].forEach((clientX) => {
+              if (hasPointer) {
+                fireEvent.pointerMove(control, { ...pointer, clientX });
+              }
+              if (hasTouch) {
+                fireEvent.touchMove(
+                  control,
+                  createTouches([{ identifier: 1, clientX, clientY: 0 }]),
+                );
+              }
+            });
+
+            expect(onValueChange).toHaveBeenLastCalledWith(
+              hasPointer ? 70 : 75,
+              expect.objectContaining({ reason: 'drag' }),
+            );
+            expect(control).toHaveAttribute('data-dragging');
+            onValueChange.mockClear();
+
+            if (cancelEvent === 'pointercancel') {
+              fireEvent.pointerCancel(control, { ...pointer, buttons: 0 });
+            } else {
+              fireEvent.touchCancel(control, createTouches([]));
+            }
+
+            expect(control).not.toHaveAttribute('data-dragging');
+            const listenerTypes = [
+              ...(hasPointer ? ['pointermove', 'pointerup', 'pointercancel'] : []),
+              ...(hasTouch ? ['touchmove', 'touchend', 'touchcancel'] : []),
+            ];
+            listenerTypes.forEach((type) => {
+              const added = addListener.mock.calls.filter(([eventType]) => eventType === type);
+              expect(added.length).toBeGreaterThan(0);
+              added.forEach(([, listener]) => {
+                expect(removeListener).toHaveBeenCalledWith(type, listener);
+              });
+            });
+
+            if (hasPointer && hasTouch) {
+              // Browsers may deliver both cancellation events for the same gesture.
+              if (cancelEvent === 'pointercancel') {
+                fireEvent.touchCancel(control, createTouches([]));
+              } else {
+                fireEvent.pointerCancel(control, { ...pointer, buttons: 0 });
+              }
+            }
+
+            expect(releasePointerCapture.mock.calls).toEqual(hasPointer ? [[7]] : []);
+
+            fireEvent.pointerDown(elsewhere, { ...pointer, pointerId: 8, clientX: 90 });
+            if (hasTouch) {
+              fireEvent.touchStart(
+                elsewhere,
+                createTouches([{ identifier: 2, clientX: 90, clientY: 0 }]),
+              );
+            }
+            fireEvent.pointerMove(elsewhere, { ...pointer, pointerId: 8, clientX: 95 });
+            if (hasTouch) {
+              fireEvent.touchMove(
+                elsewhere,
+                createTouches([{ identifier: 2, clientX: 95, clientY: 0 }]),
+              );
+            }
+            fireEvent.pointerUp(elsewhere, { ...pointer, pointerId: 8, buttons: 0 });
+            if (hasTouch) {
+              fireEvent.touchEnd(
+                elsewhere,
+                createTouches([{ identifier: 2, clientX: 95, clientY: 0 }]),
+              );
+            }
+
+            expect(onValueChange).not.toHaveBeenCalled();
+            expect(onValueCommitted).not.toHaveBeenCalled();
+            expect(control).not.toHaveAttribute('data-dragging');
+
+            // A fresh press on the track must not inherit the cancelled thumb's grab offset.
+            if (hasPointer) {
+              fireEvent.pointerDown(control, { ...pointer, clientX: 40 });
+            }
+            if (hasTouch) {
+              fireEvent.touchStart(
+                control,
+                createTouches([{ identifier: 2, clientX: 40, clientY: 0 }]),
+              );
+            }
+            if (hasPointer) {
+              fireEvent.pointerMove(control, { ...pointer, clientX: 80 });
+            }
+            if (hasTouch) {
+              fireEvent.touchMove(
+                control,
+                createTouches([{ identifier: 2, clientX: 80, clientY: 0 }]),
+              );
+            }
+            if (hasPointer) {
+              fireEvent.pointerUp(control, { ...pointer, buttons: 0, clientX: 80 });
+            }
+            if (hasTouch) {
+              fireEvent.touchEnd(
+                control,
+                createTouches([{ identifier: 2, clientX: 80, clientY: 0 }]),
+              );
+            }
+
+            expect(onValueChange).toHaveBeenLastCalledWith(
+              80,
+              expect.objectContaining({ reason: 'drag' }),
+            );
+            expect(onValueCommitted).toHaveBeenCalledExactlyOnceWith(
+              80,
+              expect.objectContaining({
+                reason: 'drag',
+                event: expect.any(hasPointer ? PointerEvent : TouchEvent),
+              }),
+            );
+            expect(control).not.toHaveAttribute('data-dragging');
+          } finally {
+            addListener.mockRestore();
+            removeListener.mockRestore();
+          }
+        },
+      );
+    });
+  });
+
   it.skipIf(isJSDOM || typeof Touch === 'undefined')(
     'handles touch interactions that originate on a text node',
     async () => {

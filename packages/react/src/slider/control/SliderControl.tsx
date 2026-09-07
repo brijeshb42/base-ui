@@ -118,6 +118,7 @@ export const SliderControl = React.forwardRef(function SliderControl(
   const vertical = orientation === 'vertical';
 
   const controlRef = React.useRef<HTMLElement>(null);
+  const focusFrame = useAnimationFrame();
   const stylesRef = React.useRef<CSSStyleDeclaration>(null);
   const setStylesRef = useStableCallback((element: HTMLElement | null) => {
     if (element && stylesRef.current == null) {
@@ -127,6 +128,7 @@ export const SliderControl = React.forwardRef(function SliderControl(
 
   // A number that uniquely identifies the current finger in the touch session.
   const touchIdRef = React.useRef<number>(null);
+  const pointerIdRef = React.useRef<number>(null);
   // The number of touch/pointermove events that have fired.
   const moveCountRef = React.useRef(0);
   // The offset amount to each side of the control for inset sliders.
@@ -343,12 +345,24 @@ export const SliderControl = React.forwardRef(function SliderControl(
     }
   });
 
-  const handleTouchEnd = useStableCallback((nativeEvent: TouchEvent | PointerEvent) => {
+  const cleanupInteraction = useStableCallback(() => {
     setActive(-1);
     setDragging(false);
+    resetPressedThumb();
+    touchIdRef.current = null;
+    moveCountRef.current = 0;
 
-    pressedThumbCenterOffsetRef.current = null;
+    const pointerId = pointerIdRef.current;
+    pointerIdRef.current = null;
+    if (pointerId != null && controlRef.current?.hasPointerCapture(pointerId)) {
+      controlRef.current.releasePointerCapture(pointerId);
+    }
 
+    // eslint-disable-next-line @typescript-eslint/no-use-before-define
+    stopListening();
+  });
+
+  const handleTouchEnd = useStableCallback((nativeEvent: TouchEvent | PointerEvent) => {
     // If the value array shrank or grew mid-drag, the cached interaction value no longer
     // matches the current thumbs (the pressed index can still be in range), so dropping it
     // keeps a stale or malformed array from being committed on release.
@@ -365,17 +379,12 @@ export const SliderControl = React.forwardRef(function SliderControl(
       );
     }
 
-    if (
-      'pointerType' in nativeEvent &&
-      controlRef.current?.hasPointerCapture(nativeEvent.pointerId)
-    ) {
-      controlRef.current?.releasePointerCapture(nativeEvent.pointerId);
-    }
+    cleanupInteraction();
+  });
 
-    pressedThumbIndexRef.current = -1;
-    touchIdRef.current = null;
-    // eslint-disable-next-line @typescript-eslint/no-use-before-define
-    stopListening();
+  const handleTouchCancel = useStableCallback(() => {
+    focusFrame.cancel();
+    cleanupInteraction();
   });
 
   const handleTouchStart = useStableCallback((nativeEvent: TouchEvent) => {
@@ -411,19 +420,20 @@ export const SliderControl = React.forwardRef(function SliderControl(
     const doc = ownerDocument(controlRef.current);
     doc.addEventListener('touchmove', handleTouchMove, { passive: true });
     doc.addEventListener('touchend', handleTouchEnd, { passive: true });
+    doc.addEventListener('touchcancel', handleTouchCancel, { passive: true });
   });
 
   const stopListening = useStableCallback(() => {
     const doc = ownerDocument(controlRef.current);
     doc.removeEventListener('pointermove', handleTouchMove);
     doc.removeEventListener('pointerup', handleTouchEnd);
+    doc.removeEventListener('pointercancel', handleTouchCancel);
     doc.removeEventListener('touchmove', handleTouchMove);
     doc.removeEventListener('touchend', handleTouchEnd);
+    doc.removeEventListener('touchcancel', handleTouchCancel);
     pressedValuesRef.current = null;
     currentInteractionValueRef.current = null;
   });
-
-  const focusFrame = useAnimationFrame();
 
   React.useEffect(() => {
     const control = controlRef.current;
@@ -506,12 +516,14 @@ export const SliderControl = React.forwardRef(function SliderControl(
 
           if (event.nativeEvent.pointerId) {
             control.setPointerCapture(event.nativeEvent.pointerId);
+            pointerIdRef.current = event.nativeEvent.pointerId;
           }
 
           moveCountRef.current = 0;
           const doc = ownerDocument(control);
           doc.addEventListener('pointermove', handleTouchMove, { passive: true });
           doc.addEventListener('pointerup', handleTouchEnd, { once: true });
+          doc.addEventListener('pointercancel', handleTouchCancel, { once: true });
         },
       },
       elementProps,
