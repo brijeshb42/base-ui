@@ -127,6 +127,8 @@ export const SliderControl = React.forwardRef(function SliderControl(
 
   // A number that uniquely identifies the current finger in the touch session.
   const touchIdRef = React.useRef<number>(null);
+  // Touch cancellation can arrive without a pointer event carrying the captured ID.
+  const capturedPointerIdRef = React.useRef<number>(null);
   // The number of touch/pointermove events that have fired.
   const moveCountRef = React.useRef(0);
   // The offset amount to each side of the control for inset sliders.
@@ -344,11 +346,6 @@ export const SliderControl = React.forwardRef(function SliderControl(
   });
 
   const handleTouchEnd = useStableCallback((nativeEvent: TouchEvent | PointerEvent) => {
-    setActive(-1);
-    setDragging(false);
-
-    pressedThumbCenterOffsetRef.current = null;
-
     // If the value array shrank or grew mid-drag, the cached interaction value no longer
     // matches the current thumbs (the pressed index can still be in range), so dropping it
     // keeps a stale or malformed array from being committed on release.
@@ -365,15 +362,23 @@ export const SliderControl = React.forwardRef(function SliderControl(
       );
     }
 
-    if (
-      'pointerType' in nativeEvent &&
-      controlRef.current?.hasPointerCapture(nativeEvent.pointerId)
-    ) {
-      controlRef.current?.releasePointerCapture(nativeEvent.pointerId);
+    // eslint-disable-next-line @typescript-eslint/no-use-before-define
+    cleanupInteraction();
+  });
+
+  const cleanupInteraction = useStableCallback(() => {
+    setActive(-1);
+    setDragging(false);
+    resetPressedThumb();
+    touchIdRef.current = null;
+    moveCountRef.current = 0;
+
+    const pointerId = capturedPointerIdRef.current;
+    capturedPointerIdRef.current = null;
+    if (pointerId != null && controlRef.current?.hasPointerCapture(pointerId)) {
+      controlRef.current.releasePointerCapture(pointerId);
     }
 
-    pressedThumbIndexRef.current = -1;
-    touchIdRef.current = null;
     // eslint-disable-next-line @typescript-eslint/no-use-before-define
     stopListening();
   });
@@ -411,14 +416,17 @@ export const SliderControl = React.forwardRef(function SliderControl(
     const doc = ownerDocument(controlRef.current);
     doc.addEventListener('touchmove', handleTouchMove, { passive: true });
     doc.addEventListener('touchend', handleTouchEnd, { passive: true });
+    doc.addEventListener('touchcancel', cleanupInteraction, { passive: true });
   });
 
   const stopListening = useStableCallback(() => {
     const doc = ownerDocument(controlRef.current);
     doc.removeEventListener('pointermove', handleTouchMove);
     doc.removeEventListener('pointerup', handleTouchEnd);
+    doc.removeEventListener('pointercancel', cleanupInteraction);
     doc.removeEventListener('touchmove', handleTouchMove);
     doc.removeEventListener('touchend', handleTouchEnd);
+    doc.removeEventListener('touchcancel', cleanupInteraction);
     pressedValuesRef.current = null;
     currentInteractionValueRef.current = null;
   });
@@ -506,12 +514,14 @@ export const SliderControl = React.forwardRef(function SliderControl(
 
           if (event.nativeEvent.pointerId) {
             control.setPointerCapture(event.nativeEvent.pointerId);
+            capturedPointerIdRef.current = event.nativeEvent.pointerId;
           }
 
           moveCountRef.current = 0;
           const doc = ownerDocument(control);
           doc.addEventListener('pointermove', handleTouchMove, { passive: true });
           doc.addEventListener('pointerup', handleTouchEnd, { once: true });
+          doc.addEventListener('pointercancel', cleanupInteraction, { once: true });
         },
       },
       elementProps,

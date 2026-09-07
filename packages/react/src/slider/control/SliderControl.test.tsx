@@ -204,6 +204,133 @@ describe('<Slider.Control />', () => {
     expect(releasePointerCapture).toHaveBeenCalledWith(7);
   });
 
+  describe.skipIf(isJSDOM || typeof Touch === 'undefined')('cancelled drags', () => {
+    [
+      { name: 'pointercancel', pointer: true, touch: false, cancels: ['pointer'] },
+      { name: 'touchcancel', pointer: false, touch: true, cancels: ['touch'] },
+      {
+        name: 'pointercancel then touchcancel',
+        pointer: true,
+        touch: true,
+        cancels: ['pointer', 'touch'],
+      },
+      {
+        name: 'touchcancel then pointercancel',
+        pointer: true,
+        touch: true,
+        cancels: ['touch', 'pointer'],
+      },
+    ].forEach(({ name, pointer, touch, cancels }) => {
+      it(`cleans up after ${name} without committing and allows a fresh gesture`, async () => {
+        const onValueChange = vi.fn();
+        const onValueCommitted = vi.fn();
+        await render(
+          <Slider.Root
+            defaultValue={20}
+            onValueChange={onValueChange}
+            onValueCommitted={onValueCommitted}
+          >
+            <Slider.Control data-testid="control">
+              <Slider.Thumb />
+            </Slider.Control>
+          </Slider.Root>,
+        );
+
+        const control = screen.getByTestId('control');
+        vi.spyOn(control, 'getBoundingClientRect').mockImplementation(getHorizontalSliderRect);
+        let captured = false;
+        const releasePointerCapture = vi.fn(() => {
+          captured = false;
+        });
+        Object.defineProperties(control, {
+          setPointerCapture: {
+            configurable: true,
+            value: () => {
+              captured = true;
+            },
+          },
+          hasPointerCapture: { configurable: true, value: () => captured },
+          releasePointerCapture: { configurable: true, value: releasePointerCapture },
+        });
+        const addListener = vi.spyOn(document, 'addEventListener');
+        const removeListener = vi.spyOn(document, 'removeEventListener');
+        const pointerOptions = { pointerId: 7, pointerType: 'touch', button: 0, buttons: 1 };
+        const touches = (clientX: number) =>
+          createTouches([{ identifier: 1, clientX, clientY: 0 }]);
+
+        if (pointer) {
+          fireEvent.pointerDown(control, { ...pointerOptions, clientX: 20 });
+        }
+        if (touch) {
+          fireEvent.touchStart(control, touches(20));
+        }
+        [40, 50, 70].forEach((clientX) => {
+          if (pointer) {
+            fireEvent.pointerMove(document.body, { ...pointerOptions, clientX });
+          }
+          if (touch) {
+            fireEvent.touchMove(document.body, touches(clientX));
+          }
+        });
+        expect(onValueChange).toHaveBeenLastCalledWith(
+          70,
+          expect.objectContaining({ reason: 'drag' }),
+        );
+        expect(control).toHaveAttribute('data-dragging');
+        onValueChange.mockClear();
+
+        cancels.forEach((cancel) => {
+          if (cancel === 'pointer') {
+            fireEvent.pointerCancel(document.body, pointerOptions);
+          } else {
+            fireEvent.touchCancel(document.body, touches(70));
+          }
+        });
+
+        expect(control).not.toHaveAttribute('data-dragging');
+        expect(onValueCommitted).not.toHaveBeenCalled();
+        expect(releasePointerCapture.mock.calls).toEqual(pointer ? [[7]] : []);
+        const listenerTypes = [
+          ...(pointer ? ['pointermove', 'pointerup', 'pointercancel'] : []),
+          ...(touch ? ['touchmove', 'touchend', 'touchcancel'] : []),
+        ];
+        listenerTypes.forEach((type) => {
+          const registration = addListener.mock.calls.find(([eventType]) => eventType === type);
+          expect(registration).toBeDefined();
+          expect(removeListener).toHaveBeenCalledWith(type, registration![1]);
+        });
+
+        fireEvent.pointerDown(document.body, { ...pointerOptions, pointerId: 8, clientX: 90 });
+        fireEvent.pointerMove(document.body, { ...pointerOptions, pointerId: 8, clientX: 90 });
+        fireEvent.pointerUp(document.body, {
+          ...pointerOptions,
+          pointerId: 8,
+          buttons: 0,
+          clientX: 90,
+        });
+        fireEvent.touchMove(document.body, touches(90));
+        fireEvent.touchEnd(document.body, touches(90));
+        expect(onValueChange).not.toHaveBeenCalled();
+        expect(onValueCommitted).not.toHaveBeenCalled();
+
+        if (touch) {
+          fireEvent.touchStart(control, touches(30));
+          fireEvent.touchMove(document.body, touches(40));
+          fireEvent.touchEnd(document.body, touches(40));
+        } else {
+          fireEvent.pointerDown(control, { ...pointerOptions, clientX: 30 });
+          fireEvent.pointerMove(document.body, { ...pointerOptions, clientX: 40 });
+          fireEvent.pointerUp(document.body, { ...pointerOptions, buttons: 0, clientX: 40 });
+        }
+        expect(onValueCommitted).toHaveBeenCalledExactlyOnceWith(
+          40,
+          expect.objectContaining({ reason: 'drag' }),
+        );
+        expect(control).not.toHaveAttribute('data-dragging');
+      });
+    });
+  });
+
   it('degrades safely when a custom render function drops the control ref', async () => {
     const onValueChange = vi.fn();
     const { unmount } = await render(
